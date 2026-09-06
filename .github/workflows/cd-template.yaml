@@ -13,7 +13,7 @@ on:
         type: string
       terraform_cli_version:
         description: 'Terraform CLI Version'
-        default: 'latest'
+        default: '1.14.9'
         type: string
 
 jobs:
@@ -32,6 +32,7 @@ jobs:
       ARM_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
       ARM_USE_AZUREAD: true
       ARM_USE_OIDC: true
+      PLAN_BLOB: "plan-bundles/${{ github.repository_id }}/${{ github.run_id }}/module.tar.gz"
 
     steps:
       - name: Checkout Code
@@ -41,7 +42,14 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
-          terraform_version: ${{ inputs.terraform_cli_version }}
+          terraform_version: ${{ inputs.terraform_cli_version || '1.14.9' }}
+
+      - name: Azure Login for Protected Plan Storage
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Terraform Init
         run: |
@@ -55,7 +63,6 @@ jobs:
 
       - name: Terraform Plan for ${{ inputs.terraform_action == 'destroy' && 'Destroy' || 'Apply' }}
         run: |
-          # shellcheck disable=SC2086
           terraform \
           -chdir="${{inputs.root_module_folder_relative_path}}" \
           plan \
@@ -63,25 +70,16 @@ jobs:
           -input=false \
           ${{ inputs.terraform_action == 'destroy' && '-destroy' || '' }}
 
-      - name: Create Module Artifact
+      - name: Store Module and Plan in Protected Blob Storage
         run: |
-          $stagingDirectory = "staging"
-          $rootModuleFolder = "${{inputs.root_module_folder_relative_path}}"
-          New-Item -Path . -Name $stagingDirectory -ItemType "directory"
-          Copy-Item -Path "./*" -Exclude @(".git", ".terraform", ".github",  $stagingDirectory) -Recurse -Destination "./$stagingDirectory"
-
-          $rootModuleFolderTerraformFolder = Join-Path -Path "./$stagingDirectory" -ChildPath $rootModuleFolder -AdditionalChildPath ".terraform"
-          if(Test-Path -Path $rootModuleFolderTerraformFolder) {
-            Remove-Item -Path $rootModuleFolderTerraformFolder -Recurse -Force
-          }
-
-        shell: pwsh
-
-      - name: Publish Module Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: module
-          path: ./staging/
+          tar --exclude='./.git' --exclude='./.github' --exclude='./.terraform' \
+            --exclude='*/.terraform' --exclude='*.tfstate' --exclude='*.tfstate.*' \
+            -czf "$RUNNER_TEMP/module.tar.gz" .
+          az storage blob upload \
+            --account-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_NAME}}" \
+            --container-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME}}" \
+            --name "$PLAN_BLOB" --file "$RUNNER_TEMP/module.tar.gz" \
+            --auth-mode login --overwrite true --only-show-errors --output none
 
       - name: Show the Plan for Review
         run: |
@@ -106,19 +104,31 @@ jobs:
       ARM_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
       ARM_USE_AZUREAD: true
       ARM_USE_OIDC: true
-      AZAPI_RETRY_GET_AFTER_PUT_MAX_TIME: "60m" # Accounts for eventually consistent management group permissions propagation
+      AZAPI_RETRY_GET_AFTER_PUT_MAX_TIME: "60m"
+      PLAN_BLOB: "plan-bundles/${{ github.repository_id }}/${{ github.run_id }}/module.tar.gz"
 
     steps:
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v4
+      - name: Azure Login for Protected Plan Storage
+        uses: azure/login@v2
         with:
-          name: module
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download Reviewed Module and Plan
+        run: |
+          az storage blob download \
+            --account-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_NAME}}" \
+            --container-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME}}" \
+            --name "$PLAN_BLOB" --file "$RUNNER_TEMP/module.tar.gz" \
+            --auth-mode login --only-show-errors --output none
+          tar -xzf "$RUNNER_TEMP/module.tar.gz" -C "$GITHUB_WORKSPACE"
 
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
-          terraform_version: ${{ inputs.terraform_cli_version }}
+          terraform_version: ${{ inputs.terraform_cli_version || '1.14.9' }}
 
       - name: Terraform Init
         run: |
@@ -138,3 +148,10 @@ jobs:
           -input=false \
           -auto-approve \
           tfplan
+
+      - name: Remove Consumed Plan Bundle
+        run: |
+          az storage blob delete \
+            --account-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_NAME}}" \
+            --container-name "${{vars.BACKEND_AZURE_STORAGE_ACCOUNT_CONTAINER_NAME}}" \
+            --name "$PLAN_BLOB" --auth-mode login --only-show-errors --output none
